@@ -1,137 +1,252 @@
-"""
-    Script to transform raw AirNow data files into BigQuery-compatible formats.
+"""Prepare raw AirNow files as CSV, JSONL, Parquet, and GeoParquet.
 
-    This script reads the raw .dat files downloaded by 01_extract.py and converts
-    them into CSV, JSON-L, and Parquet formats suitable for loading into
-    BigQuery as external tables.
-
-    Hourly observation data is converted to: CSV, JSON-L, Parquet
-    Site location data is converted to: CSV, JSON-L, GeoParquet (with point geometry)
-
-    Usage:
-        python scripts/02_prepare.py
+Examples:
+    python scripts/02_prepare.py --start 2024-07-01 --end 2024-07-01
+    python scripts/02_prepare.py --start 2024-07-01 --end 2024-07-31
 """
 
-import pathlib
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+from pathlib import Path
+
+import pandas as pd
 
 
-DATA_DIR = pathlib.Path(__file__).parent.parent / 'data'
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+RAW_DIR = DATA_DIR / "raw"
+PREPARED_DIR = DATA_DIR / "prepared"
+HOURLY_DIR = PREPARED_DIR / "hourly"
+SITES_DIR = PREPARED_DIR / "sites"
+AIRNOW_ENCODING = "latin1"
 
 HOURLY_COLUMNS = [
-    'valid_date',
-    'valid_time',
-    'aqsid',
-    'site_name',
-    'gmt_offset',
-    'parameter_name',
-    'reporting_units',
-    'value',
-    'data_source',
+    "valid_date",
+    "valid_time",
+    "aqsid",
+    "site_name",
+    "gmt_offset",
+    "parameter_name",
+    "reporting_units",
+    "value",
+    "data_source",
 ]
 
 
-# --- Hourly observation data ---
-
-def prepare_hourly_csv(date_str):
-    """Convert raw hourly .dat files for a date to a single CSV file.
-
-    Reads all 24 HourlyData_*.dat files from data/raw/<date>/,
-    combines them into a single dataset, assigns column names,
-    and writes to data/prepared/hourly/<date>.csv.
-
-    Args:
-        date_str: Date string in 'YYYY-MM-DD' format.
-    """
-    raise NotImplementedError("Implement this function.")
+def parse_date(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a valid date. Use YYYY-MM-DD."
+        ) from exc
 
 
-def prepare_hourly_jsonl(date_str):
-    """Convert raw hourly .dat files for a date to newline-delimited JSON.
+def iter_dates(start: dt.date, end: dt.date):
+    if end < start:
+        raise ValueError("--end must be on or after --start")
 
-    Reads all 24 HourlyData_*.dat files from data/raw/<date>/,
-    combines them, and writes one JSON object per line to
-    data/prepared/hourly/<date>.jsonl.
-
-    Args:
-        date_str: Date string in 'YYYY-MM-DD' format.
-    """
-    raise NotImplementedError("Implement this function.")
+    current = start
+    while current <= end:
+        yield current
+        current += dt.timedelta(days=1)
 
 
-def prepare_hourly_parquet(date_str):
-    """Convert raw hourly .dat files for a date to Parquet format.
-
-    Reads all 24 HourlyData_*.dat files from data/raw/<date>/,
-    combines them, and writes to data/prepared/hourly/<date>.parquet.
-
-    Args:
-        date_str: Date string in 'YYYY-MM-DD' format.
-    """
-    raise NotImplementedError("Implement this function.")
+def raw_date_dir(date_str: str) -> Path:
+    path = RAW_DIR / date_str
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing raw directory {path}. Run scripts/01_extract.py first."
+        )
+    return path
 
 
-# --- Site location data ---
-
-def prepare_site_locations_csv():
-    """Convert monitoring site locations to CSV.
-
-    Reads the Monitoring_Site_Locations_V2.dat file, deduplicates
-    so there is one row per site (the raw file has one row per
-    site-parameter combination), and writes to
-    data/prepared/sites/site_locations.csv.
-
-    Use the most recent date's file from data/raw/.
-    """
-    raise NotImplementedError("Implement this function.")
+def normalize_valid_time(series: pd.Series) -> pd.Series:
+    """Return BigQuery-friendly HH:MM:SS time strings where possible."""
+    as_text = series.astype("string").str.strip()
+    parsed = pd.to_datetime(as_text, errors="coerce").dt.strftime("%H:%M:%S")
+    return parsed.fillna(as_text)
 
 
-def prepare_site_locations_jsonl():
-    """Convert monitoring site locations to newline-delimited JSON.
+def read_hourly_for_date(date_str: str) -> pd.DataFrame:
+    """Read and combine all available hourly files for one date."""
+    date_dir = raw_date_dir(date_str)
+    expected_files = [
+        date_dir / f"HourlyData_{date_str.replace('-', '')}{hour:02d}.dat"
+        for hour in range(24)
+    ]
+    missing_files = [path.name for path in expected_files if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError(
+            f"{date_str} is missing {len(missing_files)} hourly files, "
+            f"including {missing_files[0]}. Re-run extraction for this date."
+        )
 
-    Reads the Monitoring_Site_Locations_V2.dat file, deduplicates
-    so there is one row per site (the raw file has one row per
-    site-parameter combination), and writes to
-    data/prepared/sites/site_locations.jsonl.
+    frames = []
+    for path in expected_files:
+        frame = pd.read_csv(
+            path,
+            sep="|",
+            header=None,
+            names=HOURLY_COLUMNS,
+            encoding=AIRNOW_ENCODING,
+            dtype={
+                "valid_date": "string",
+                "valid_time": "string",
+                "aqsid": "string",
+                "site_name": "string",
+                "parameter_name": "string",
+                "reporting_units": "string",
+                "data_source": "string",
+            },
+        )
+        frames.append(frame)
 
-    Use the most recent date's file from data/raw/.
-    """
-    raise NotImplementedError("Implement this function.")
+    combined = pd.concat(frames, ignore_index=True)
+    combined["valid_date"] = pd.to_datetime(
+        combined["valid_date"], errors="coerce"
+    ).dt.date.astype("string")
+    combined["valid_date"] = combined["valid_date"].fillna(date_str)
+    combined["valid_time"] = normalize_valid_time(combined["valid_time"])
+    combined["gmt_offset"] = pd.to_numeric(combined["gmt_offset"], errors="coerce")
+    combined["value"] = pd.to_numeric(combined["value"], errors="coerce")
+    return combined
 
 
-def prepare_site_locations_geoparquet():
-    """Convert monitoring site locations to GeoParquet with point geometry.
+def prepare_hourly_outputs(date_str: str) -> None:
+    """Write CSV, JSONL, and Parquet hourly files for one date."""
+    HOURLY_DIR.mkdir(parents=True, exist_ok=True)
+    output_base = HOURLY_DIR / date_str
 
-    Reads the Monitoring_Site_Locations_V2.dat file, deduplicates
-    so there is one row per site (the raw file has one row per
-    site-parameter combination), creates point geometries from
-    latitude and longitude, and writes to
-    data/prepared/sites/site_locations.geoparquet.
+    hourly = read_hourly_for_date(date_str)
+    hourly.to_csv(output_base.with_suffix(".csv"), index=False)
+    hourly.to_json(
+        output_base.with_suffix(".jsonl"),
+        orient="records",
+        lines=True,
+        date_format="iso",
+    )
+    hourly.to_parquet(output_base.with_suffix(".parquet"), index=False)
+    print(f"  wrote hourly files for {date_str} ({len(hourly):,} rows)")
 
-    Use the most recent date's file from data/raw/.
-    """
-    raise NotImplementedError("Implement this function.")
+
+def prepare_hourly_csv(date_str: str) -> None:
+    prepare_hourly_outputs(date_str)
 
 
-if __name__ == '__main__':
-    import datetime
+def prepare_hourly_jsonl(date_str: str) -> None:
+    prepare_hourly_outputs(date_str)
 
-    # Prepare site locations (only need to do this once)
-    print('Preparing site locations...')
-    prepare_site_locations_csv()
-    prepare_site_locations_jsonl()
-    prepare_site_locations_geoparquet()
 
-    # Prepare hourly data for each day in July 2024 (backfill)
-    start_date = datetime.date(2024, 7, 1)
-    end_date = datetime.date(2024, 7, 31)
+def prepare_hourly_parquet(date_str: str) -> None:
+    prepare_hourly_outputs(date_str)
 
-    current_date = start_date
-    while current_date <= end_date:
-        date_str = current_date.isoformat()
-        print(f'Preparing hourly data for {date_str}...')
-        prepare_hourly_csv(date_str)
-        prepare_hourly_jsonl(date_str)
-        prepare_hourly_parquet(date_str)
-        current_date += datetime.timedelta(days=1)
 
-    print('Done.')
+def find_site_locations_file(preferred_date: str | None = None) -> Path:
+    """Find a Monitoring_Site_Locations_V2.dat file in data/raw."""
+    if preferred_date:
+        preferred_path = RAW_DIR / preferred_date / "Monitoring_Site_Locations_V2.dat"
+        if preferred_path.exists():
+            return preferred_path
+        raise FileNotFoundError(
+            f"Missing {preferred_path}. Run extraction for {preferred_date} first."
+        )
+
+    candidates = sorted(RAW_DIR.glob("*/Monitoring_Site_Locations_V2.dat"))
+    if not candidates:
+        raise FileNotFoundError(
+            "No Monitoring_Site_Locations_V2.dat files found under data/raw/."
+        )
+    return candidates[-1]
+
+
+def read_site_locations(preferred_date: str | None = None) -> pd.DataFrame:
+    """Read, type, and deduplicate site locations to one row per AQSID."""
+    path = find_site_locations_file(preferred_date)
+    sites = pd.read_csv(path, sep="|", encoding=AIRNOW_ENCODING, dtype="string")
+    sites.columns = [column.strip() for column in sites.columns]
+
+    required = {"AQSID", "Latitude", "Longitude"}
+    missing = required.difference(sites.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+
+    sites["AQSID"] = sites["AQSID"].astype("string").str.strip()
+    sites["Latitude"] = pd.to_numeric(sites["Latitude"], errors="coerce")
+    sites["Longitude"] = pd.to_numeric(sites["Longitude"], errors="coerce")
+    sites = sites.dropna(subset=["AQSID", "Latitude", "Longitude"])
+    sites = sites.drop_duplicates(subset=["AQSID"], keep="first")
+    return sites
+
+
+def prepare_site_locations_outputs(preferred_date: str | None = None) -> None:
+    """Write CSV, JSONL, and GeoParquet site location files."""
+    SITES_DIR.mkdir(parents=True, exist_ok=True)
+    sites = read_site_locations(preferred_date)
+
+    sites.to_csv(SITES_DIR / "site_locations.csv", index=False)
+    sites.to_json(
+        SITES_DIR / "site_locations.jsonl",
+        orient="records",
+        lines=True,
+        date_format="iso",
+    )
+
+    import geopandas as gpd
+
+    geometry = gpd.points_from_xy(sites["Longitude"], sites["Latitude"])
+    geo_sites = gpd.GeoDataFrame(sites, geometry=geometry, crs="EPSG:4326")
+    geo_sites.to_parquet(SITES_DIR / "site_locations.geoparquet", index=False)
+    print(f"  wrote site location files ({len(sites):,} deduplicated rows)")
+
+
+def prepare_site_locations_csv() -> None:
+    prepare_site_locations_outputs()
+
+
+def prepare_site_locations_jsonl() -> None:
+    prepare_site_locations_outputs()
+
+
+def prepare_site_locations_geoparquet() -> None:
+    prepare_site_locations_outputs()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Prepare raw AirNow data as BigQuery-friendly files."
+    )
+    parser.add_argument("--start", type=parse_date, default=dt.date(2024, 7, 1))
+    parser.add_argument("--end", type=parse_date, default=dt.date(2024, 7, 31))
+    parser.add_argument(
+        "--sites-date",
+        type=parse_date,
+        help="Use the site locations file from this raw date. Defaults to --end.",
+    )
+    parser.add_argument(
+        "--skip-sites",
+        action="store_true",
+        help="Only prepare hourly files; do not write site location outputs.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    sites_date = args.sites_date or args.end
+    if not args.skip_sites:
+        print(f"Preparing site locations from {sites_date.isoformat()}")
+        prepare_site_locations_outputs(sites_date.isoformat())
+
+    for file_date in iter_dates(args.start, args.end):
+        date_str = file_date.isoformat()
+        print(f"Preparing hourly data for {date_str}")
+        prepare_hourly_outputs(date_str)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
